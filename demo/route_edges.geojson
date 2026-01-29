@@ -1,0 +1,23 @@
+{
+"type": "FeatureCollection",
+"name": "route_edges",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { "u": 2188381259, "v": 312467894, "key": 0, "length": 49.927262534881535 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8172675, 62.7877741 ], [ 22.8174666, 62.7877261 ], [ 22.8177994, 62.7876838 ], [ 22.8182082, 62.7876627 ] ] } },
+{ "type": "Feature", "properties": { "u": 312467894, "v": 312467895, "key": 0, "length": 35.278646424774365 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8182082, 62.7876627 ], [ 22.8188002, 62.7876428 ], [ 22.8189004, 62.7876424 ] ] } },
+{ "type": "Feature", "properties": { "u": 312467895, "v": 310007402, "key": 0, "length": 14.883601136838145 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8189004, 62.7876424 ], [ 22.818924, 62.7875964 ], [ 22.8189332, 62.7875099 ] ] } },
+{ "type": "Feature", "properties": { "u": 310007402, "v": 310007401, "key": 0, "length": 10.061706704117645 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8189332, 62.7875099 ], [ 22.8190805, 62.7875081 ], [ 22.819131, 62.7875088 ] ] } },
+{ "type": "Feature", "properties": { "u": 310007401, "v": 2064740484, "key": 0, "length": 6.8878092170420846 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.819131, 62.7875088 ], [ 22.8192664, 62.7875106 ] ] } },
+{ "type": "Feature", "properties": { "u": 2064740484, "v": 310007400, "key": 0, "length": 7.9056577634697174 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8192664, 62.7875106 ], [ 22.8194218, 62.7875128 ] ] } },
+{ "type": "Feature", "properties": { "u": 310007400, "v": 3446250984, "key": 0, "length": 34.094468835228874 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8194218, 62.7875128 ], [ 22.8194545, 62.7875132 ], [ 22.8200866, 62.7875521 ] ] } },
+{ "type": "Feature", "properties": { "u": 3446250984, "v": 9316513426, "key": 0, "length": 25.012633730958825 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8200866, 62.7875521 ], [ 22.8205744, 62.7875811 ] ] } },
+{ "type": "Feature", "properties": { "u": 9316513426, "v": 2064740485, "key": 0, "length": 10.669589490564164 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8205744, 62.7875811 ], [ 22.8207825, 62.7875934 ] ] } },
+{ "type": "Feature", "properties": { "u": 2064740485, "v": 9022104374, "key": 0, "length": 16.405650946728084 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8207825, 62.7875934 ], [ 22.8211021, 62.7876136 ] ] } },
+{ "type": "Feature", "properties": { "u": 9022104374, "v": 1820280766, "key": 0, "length": 6.7701082466881299 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8211021, 62.7876136 ], [ 22.821234, 62.7876219 ] ] } },
+{ "type": "Feature", "properties": { "u": 1820280766, "v": 9022104375, "key": 0, "length": 17.24976027280653 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.821234, 62.7876219 ], [ 22.8215681, 62.7876488 ] ] } },
+{ "type": "Feature", "properties": { "u": 9022104375, "v": 9317425486, "key": 0, "length": 53.780788426661104 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8215681, 62.7876488 ], [ 22.821819, 62.787669 ], [ 22.8221216, 62.7877124 ], [ 22.8225804, 62.7877854 ] ] } },
+{ "type": "Feature", "properties": { "u": 9317425486, "v": 2064740487, "key": 0, "length": 24.193801395292425 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8225804, 62.7877854 ], [ 22.8227607, 62.7878141 ], [ 22.8230283, 62.7878588 ] ] } },
+{ "type": "Feature", "properties": { "u": 2064740487, "v": 1452641367, "key": 0, "length": 18.83263650823039 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8230283, 62.7878588 ], [ 22.8233773, 62.7879155 ] ] } },
+{ "type": "Feature", "properties": { "u": 1452641367, "v": 2075974984, "key": 0, "length": 29.428658458872313 }, "geometry": { "type": "LineString", "coordinates": [ [ 22.8233773, 62.7879155 ], [ 22.8234066, 62.7880031 ], [ 22.823436, 62.7880738 ], [ 22.8234891, 62.788175 ] ] } }
+]
+}
