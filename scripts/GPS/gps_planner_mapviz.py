@@ -467,7 +467,7 @@ class ClickPlanner(Node):
             self._fromll_futures.clear()
             self._pending_lonlats.clear()
 
-        self.get_logger().info(f"[fromLL] conversion complete ✅ points={len(route_map)}")
+        self.get_logger().info(f"[fromLL] conversion complete points={len(route_map)}")
         self._finalize_route_and_start(route_map)
 
     # ---------------- Nav2 goal sending (sequential) ----------------
@@ -478,7 +478,7 @@ class ClickPlanner(Node):
         if self._in_flight:
             return
         if self._idx >= len(self._route_map):
-            self.get_logger().info("[nav2] finished all goals ✅")
+            self.get_logger().info("[nav2] finished all goals ")
             return
 
         # Wait for action server
@@ -510,7 +510,7 @@ class ClickPlanner(Node):
     def _on_goal_response(self, future):
         gh = future.result()
         if not gh.accepted:
-            self.get_logger().error("[nav2] goal rejected ❌")
+            self.get_logger().error("[nav2] goal rejected")
             self._in_flight = False
             return
         rf = gh.get_result_async()
@@ -542,7 +542,7 @@ def main():
     parser.add_argument("--plot", action="store_true", help="Show live matplotlib plot")
     parser.add_argument("--use-fromll", action="store_true", help="Use robot_localization /fromLL to convert lon/lat to map")
     parser.add_argument("--fromll-service", default="/fromLL", help="Service name for FromLL (default: /fromLL)")
-    parser.add_argument("--spacing", type=float, default=1.0, help="Densify spacing in meters (smaller => more points)")
+    parser.add_argument("--spacing", type=float, default=10.0, help="Densify spacing in meters (smaller => more points)")
     parser.add_argument("--graph-dist", type=float, default=1200.0, help="OSMnx graph dist in meters")
     parser.add_argument("--network-type", default="all", help="OSMnx network_type (all, walk, drive, bike)")
     parser.add_argument("--clicked-topic", default="/clicked_point", help="Mapviz click topic")
