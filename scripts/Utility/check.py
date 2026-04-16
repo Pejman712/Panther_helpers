@@ -10,6 +10,7 @@ Improvements in this version
 - Better action detection with optional namespace prefix
 - Better type-mismatch / publisher diagnostics
 - Safer subscriptions for /tf and /tf_static
+- Dedicated checks for /odom, /panther/odometry/wheels, and /cmd_vel
 
 Environment overrides
 - NAVDBG_NAMESPACE=/robot_ns
@@ -186,8 +187,20 @@ DEFAULT_EXPECTED = {
             "aliases": ["/fixposition/odometry_enu", "/odometry/filtered", "/odom"],
             "types": ["nav_msgs/msg/Odometry"],
         },
+        "odom_raw": {
+            "aliases": ["/odom"],
+            "types": ["nav_msgs/msg/Odometry"],
+        },
+        "odom_wheels": {
+            "aliases": ["/panther/odometry/wheels"],
+            "types": ["nav_msgs/msg/Odometry"],
+        },
         "cmd_vel": {
             "aliases": ["/panther/cmd_vel", "/cmd_vel"],
+            "types": ["geometry_msgs/msg/Twist"],
+        },
+        "cmd_vel_raw": {
+            "aliases": ["/cmd_vel"],
             "types": ["geometry_msgs/msg/Twist"],
         },
     },
@@ -680,9 +693,33 @@ class RosInspectorNode(Node):
                 f"(check QoS or publisher health)"
             )
 
+        odom_raw_st = required_topics.get("odom_raw")
+        if odom_raw_st and odom_raw_st.exists and odom_raw_st.msg_count == 0:
+            warnings.append(
+                f"Plain /odom topic exists but no messages received: {odom_raw_st.actual_name} "
+                f"(check QoS or publisher health)"
+            )
+
+        odom_wheels_st = required_topics.get("odom_wheels")
+        if odom_wheels_st and odom_wheels_st.exists and odom_wheels_st.msg_count == 0:
+            warnings.append(
+                f"Wheel odom topic exists but no messages received: {odom_wheels_st.actual_name} "
+                f"(check QoS or wheel odometry publisher health)"
+            )
+
         cmd_st = required_topics.get("cmd_vel")
         if cmd_st and not cmd_st.exists:
             warnings.append("No cmd_vel output topic found. Checked aliases: /panther/cmd_vel, /cmd_vel")
+
+        cmd_raw_st = required_topics.get("cmd_vel_raw")
+        if cmd_raw_st and not cmd_raw_st.exists:
+            warnings.append("No plain /cmd_vel topic found.")
+
+        if cmd_raw_st and cmd_raw_st.exists and cmd_raw_st.msg_count == 0:
+            warnings.append(
+                f"Plain /cmd_vel topic exists but no messages received: {cmd_raw_st.actual_name} "
+                f"(check publisher health or QoS)"
+            )
 
         imu_st = optional_topics.get("imu")
         if imu_st and imu_st.exists and imu_st.msg_count == 0:
