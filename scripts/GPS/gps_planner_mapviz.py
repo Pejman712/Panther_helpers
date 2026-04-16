@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """
-Mapviz click (wgs84) START+GOAL -> OSMnx route planning -> (choose conversion) -> densify -> Nav2 NavigateToPose
+Mapviz click (wgs84) START+GOAL -> OSMnx route planning -> (choose conversion) -> densify -> Nav2 BasicNavigator.goToPose()
+
+Integrated nav logic:
+- Uses nav2_simple_commander.BasicNavigator like the first code
+- Sends ONE PoseStamped at a time with goToPose()
+- Waits until navigator.isTaskComplete() before sending the next goal
 
 Conversion modes:
   A) Anchor (default): lon/lat -> UTM local XY -> anchor at current robot pose in "map" using TF
   B) FromLL: lon/lat -> robot_localization /fromLL -> "map" points
 
 Features:
-- Waits for EACH NavigateToPose result before sending next goal
+- Waits for EACH goal to finish before sending next goal
 - Densifies route with spacing_m (more points = smaller spacing)
 - Optional live matplotlib plot (--plot)
 
 Run examples:
-  python3 gps_planner_mapviz.py
-  python3 gps_planner_mapviz.py --plot
-  python3 gps_planner_mapviz.py --use-fromll
-  python3 gps_planner_mapviz.py --use-fromll --fromll-service /fromLL --spacing 0.5
+  python3 gps_planner_mapviz_basicnav.py
+  python3 gps_planner_mapviz_basicnav.py --plot
+  python3 gps_planner_mapviz_basicnav.py --use-fromll
+  python3 gps_planner_mapviz_basicnav.py --use-fromll --fromll-service /fromLL --spacing 0.5
 """
 
 import argparse
@@ -25,17 +30,13 @@ from typing import List, Tuple, Optional
 
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionClient
 from rclpy.task import Future
 
 from geometry_msgs.msg import PointStamped, PoseStamped, Quaternion
-from nav2_msgs.action import NavigateToPose
-from action_msgs.msg import GoalStatus
-
 from tf2_ros import Buffer, TransformListener
-
 from pyproj import CRS, Transformer
 from robot_localization.srv import FromLL
+from nav2_simple_commander.robot_navigator import BasicNavigator
 
 
 # ======================= geometry helpers =======================
@@ -56,7 +57,6 @@ def yaw_to_quat(yaw: float) -> Quaternion:
 
 
 def yaw_from_quaternion(q: Quaternion) -> float:
-    # planar yaw only
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
@@ -90,12 +90,10 @@ def resample_polyline(points: List[Tuple[float, float]], spacing_m: float) -> Li
 
         out.append((x1, y1))
 
-        # update carry: how far are we past the last perfect spacing mark?
         last_mark = dist - spacing_m
         remain = seg_len - last_mark
         carry = 0.0 if remain < 1e-6 else (spacing_m - remain)
 
-    # remove consecutive duplicates
     filtered: List[Tuple[float, float]] = []
     last = None
     for p in out:
@@ -150,7 +148,6 @@ def plan_osmnx_route_lonlat(
             seg = seg[1:]
         coords.extend([(float(x), float(y)) for x, y in seg])
 
-    # remove consecutive duplicates
     filtered: List[Tuple[float, float]] = []
     last = None
     for p in coords:
@@ -176,9 +173,9 @@ class ClickPlanner(Node):
         require_frame: str,
         goal_frame: str,
         base_frame: str,
-        server_name: str,
         continue_on_abort: bool,
         max_goals: int,
+        skip_near_m: float,
     ):
         super().__init__("gps_click_planner")
 
@@ -192,12 +189,12 @@ class ClickPlanner(Node):
         self.require_frame = require_frame
         self.goal_frame = goal_frame
         self.base_frame = base_frame
-        self.server_name = server_name
         self.continue_on_abort = continue_on_abort
         self.max_goals = max_goals
+        self.skip_near_m = skip_near_m
 
-        # Nav2 action client
-        self._action_client = ActionClient(self, NavigateToPose, self.server_name)
+        # BasicNavigator (same style as your first script)
+        self.navigator = BasicNavigator("basic_navigator")
 
         # TF
         self.tf_buffer = Buffer()
@@ -207,7 +204,6 @@ class ClickPlanner(Node):
         self.fromll_client = None
         self._fromll_futures: List[Future] = []
         self._pending_lonlats: List[Tuple[float, float]] = []
-        self._converted_map_pts: List[Tuple[float, float]] = []
         self._converting = False
 
         if self.use_fromll:
@@ -222,17 +218,16 @@ class ClickPlanner(Node):
         # Route / goal state
         self.start_ll: Optional[Tuple[float, float]] = None  # (lat,lon)
         self.goal_ll: Optional[Tuple[float, float]] = None
-
-        self._route_map: Optional[List[Tuple[float, float]]] = None  # [(x,y) in map]
+        self._route_map: Optional[List[Tuple[float, float]]] = None
         self._idx = 0
-        self._in_flight = False
+        self._nav_active = False
 
         # Plot
         if self.enable_plot:
             self._init_plot()
             self._plot_timer = self.create_timer(0.2, self._plot_update)
 
-        # Main periodic worker (handles fromLL conversions + safety)
+        # Main periodic worker
         self._worker_timer = self.create_timer(0.1, self._worker)
 
         self.get_logger().info(
@@ -245,12 +240,12 @@ class ClickPlanner(Node):
 
     def _init_plot(self):
         import matplotlib
-        matplotlib.use("TkAgg")  # sudo apt install python3-tk
+        matplotlib.use("TkAgg")
         import matplotlib.pyplot as plt
         self._plt = plt
         self._fig, self._ax = plt.subplots()
         self._ax.set_aspect("equal", adjustable="datalim")
-        self._ax.set_title("Route in map frame (anchored or fromLL)")
+        self._ax.set_title("Route in map frame")
         self._ax.set_xlabel("x (m)")
         self._ax.set_ylabel("y (m)")
         (self._route_line,) = self._ax.plot([], [], marker="o", linestyle="-", label="Route/Goals")
@@ -316,7 +311,6 @@ class ClickPlanner(Node):
             self._plan_route_and_prepare()
             return
 
-        # third click resets
         self.get_logger().info("[state] resetting (new START)")
         self._reset_all()
         self.start_ll = (lat, lon)
@@ -327,11 +321,10 @@ class ClickPlanner(Node):
         self.goal_ll = None
         self._route_map = None
         self._idx = 0
-        self._in_flight = False
+        self._nav_active = False
 
         self._fromll_futures.clear()
         self._pending_lonlats.clear()
-        self._converted_map_pts.clear()
         self._converting = False
 
     # ---------------- planning + conversion ----------------
@@ -341,11 +334,13 @@ class ClickPlanner(Node):
         s_lat, s_lon = self.start_ll
         g_lat, g_lon = self.goal_ll
 
-        # Plan
         t0 = time.time()
         try:
             lonlats = plan_osmnx_route_lonlat(
-                s_lat, s_lon, g_lat, g_lon,
+                s_lat,
+                s_lon,
+                g_lat,
+                g_lon,
                 network_type=self.network_type,
                 dist_m=self.graph_dist_m,
             )
@@ -366,9 +361,7 @@ class ClickPlanner(Node):
                 self._reset_all()
                 return
 
-            # Queue async conversions (do NOT block inside subscription callback)
-            self._pending_lonlats = lonlats[:]  # [(lon,lat)]
-            self._converted_map_pts = []
+            self._pending_lonlats = lonlats[:]
             self._fromll_futures = []
             self._converting = True
 
@@ -382,10 +375,7 @@ class ClickPlanner(Node):
                     self.get_logger().info(f"[fromLL] queued {i}/{len(self._pending_lonlats)}")
 
             self.get_logger().info("[fromLL] all conversions queued ✅")
-            # worker() will finalize route, densify, and start nav
-
         else:
-            # Anchor method: lon/lat -> UTM local -> anchor at robot pose in map
             try:
                 route_map = self._convert_anchor(lonlats)
             except Exception as e:
@@ -396,6 +386,10 @@ class ClickPlanner(Node):
             self._finalize_route_and_start(route_map)
 
     def _convert_anchor(self, lonlats: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """
+        Convert lon/lat route to local UTM coordinates, then anchor and rotate it into map frame
+        using the robot's current pose.
+        """
         lon0, lat0 = lonlats[0]
         utm = utm_crs_for_lonlat(lon0, lat0)
         to_utm = Transformer.from_crs("EPSG:4326", utm, always_xy=True)
@@ -406,133 +400,156 @@ class ClickPlanner(Node):
             x, y = to_utm.transform(lon, lat)
             local_xy.append((x - x0, y - y0))
 
-        # anchor at current robot pose in map frame
         rx, ry, ryaw = self._get_robot_pose()
         self.get_logger().info(f"[anchor] robot pose: x={rx:.2f} y={ry:.2f} yaw={ryaw:.2f}")
 
-        return [(rx + dx, ry + dy) for (dx, dy) in local_xy]
+        c = math.cos(ryaw)
+        s = math.sin(ryaw)
+
+        route_map: List[Tuple[float, float]] = []
+        for dx, dy in local_xy:
+            mx = rx + c * dx - s * dy
+            my = ry + s * dx + c * dy
+            route_map.append((mx, my))
+
+        return route_map
 
     def _finalize_route_and_start(self, route_map: List[Tuple[float, float]]):
-        # Densify
         before = len(route_map)
         route_map = resample_polyline(route_map, self.spacing_m)
         after = len(route_map)
         self.get_logger().info(f"[route] densified ✅ points={after} (was {before}) spacing_m={self.spacing_m:.2f}")
 
-        # Cap goals (optional safety)
         if self.max_goals > 0 and len(route_map) > self.max_goals:
+            original_last = route_map[-1]
             step = max(1, len(route_map) // self.max_goals)
             route_map = route_map[::step]
-            # ensure last point remains
-            if route_map[-1] != route_map[-1]:
-                route_map.append(route_map[-1])
+            if route_map[-1] != original_last:
+                route_map.append(original_last)
             self.get_logger().warning(f"[route] capped goals to {len(route_map)} (max_goals={self.max_goals})")
+
+        # Optionally skip points too close to robot
+        try:
+            rx, ry, _ = self._get_robot_pose()
+            while route_map:
+                d = math.hypot(route_map[0][0] - rx, route_map[0][1] - ry)
+                if d < self.skip_near_m:
+                    self.get_logger().info(f"[route] skipping near start goal d={d:.2f}m < {self.skip_near_m:.2f}m")
+                    route_map.pop(0)
+                else:
+                    break
+        except Exception as e:
+            self.get_logger().warning(f"[route] could not evaluate skip_near_m: {e}")
+
+        if not route_map:
+            self.get_logger().error("[route] no usable goals remain after filtering ❌")
+            self._reset_all()
+            return
 
         self._route_map = route_map
         self._idx = 0
-        self._in_flight = False
+        self._nav_active = False
 
         self.get_logger().info(f"[nav2] route ready ✅ goals={len(self._route_map)} starting...")
         self._send_next_goal()
 
-    # ---------------- worker for fromLL async conversions ----------------
+    # ---------------- worker ----------------
 
     def _worker(self):
-        if not self._converting:
+        # Handle fromLL conversions
+        if self._converting:
+            if not self._fromll_futures:
+                return
+
+            if any(not f.done() for f in self._fromll_futures):
+                return
+
+            route_map: List[Tuple[float, float]] = []
+            try:
+                for i, f in enumerate(self._fromll_futures, start=1):
+                    resp = f.result()
+                    route_map.append((float(resp.map_point.x), float(resp.map_point.y)))
+                    if i == 1 or i == len(self._fromll_futures) or i % 50 == 0:
+                        self.get_logger().info(f"[fromLL] converted {i}/{len(self._fromll_futures)}")
+            except Exception as e:
+                self.get_logger().error(f"[fromLL] conversion failed ❌: {e}")
+                self._reset_all()
+                return
+            finally:
+                self._converting = False
+                self._fromll_futures.clear()
+                self._pending_lonlats.clear()
+
+            self.get_logger().info(f"[fromLL] conversion complete points={len(route_map)}")
+            self._finalize_route_and_start(route_map)
             return
 
-        # Collect completed futures (keep order consistent with requests)
-        # We queued futures in the same order as lonlats, so we can rebuild in order.
-        if not self._fromll_futures:
-            return
+        # Poll current BasicNavigator task and send next goal when done
+        if self._nav_active and self._route_map is not None:
+            if not self.navigator.isTaskComplete():
+                feedback = self.navigator.getFeedback()
+                if feedback is not None:
+                    self.get_logger().debug(f"[nav2] feedback: {feedback}")
+                return
 
-        # If any not done yet, wait
-        if any(not f.done() for f in self._fromll_futures):
-            return
+            result = self.navigator.getResult()
+            self.get_logger().info(f"[nav2] result: {result}")
+            self._nav_active = False
 
-        # All done: build route_map in order
-        route_map: List[Tuple[float, float]] = []
-        try:
-            for i, f in enumerate(self._fromll_futures, start=1):
-                resp = f.result()
-                route_map.append((float(resp.map_point.x), float(resp.map_point.y)))
-                if i == 1 or i == len(self._fromll_futures) or i % 50 == 0:
-                    self.get_logger().info(f"[fromLL] converted {i}/{len(self._fromll_futures)}")
-        except Exception as e:
-            self.get_logger().error(f"[fromLL] conversion failed ❌: {e}")
-            self._reset_all()
-            return
-        finally:
-            self._converting = False
-            self._fromll_futures.clear()
-            self._pending_lonlats.clear()
+            # BasicNavigator result can be compared against TaskResult enum values,
+            # but logging the raw result is often enough for diagnosis.
+            result_str = str(result).lower()
 
-        self.get_logger().info(f"[fromLL] conversion complete points={len(route_map)}")
-        self._finalize_route_and_start(route_map)
+            if "succeeded" in result_str:
+                self._idx += 1
+                self._send_next_goal()
+                return
 
-    # ---------------- Nav2 goal sending (sequential) ----------------
+            if self.continue_on_abort:
+                self.get_logger().warning("[nav2] goal failed, continuing (continue_on_abort=True)")
+                self._idx += 1
+                self._send_next_goal()
+            else:
+                self.get_logger().error("[nav2] goal failed, stopping (continue_on_abort=False)")
+
+    # ---------------- Nav2 BasicNavigator sequential sending ----------------
 
     def _send_next_goal(self):
         if self._route_map is None:
             return
-        if self._in_flight:
+        if self._nav_active:
             return
         if self._idx >= len(self._route_map):
-            self.get_logger().info("[nav2] finished all goals ")
+            self.get_logger().info("[nav2] finished all goals ✅")
             return
 
-        # Wait for action server
-        while rclpy.ok() and not self._action_client.wait_for_server(timeout_sec=1.0):
-            self.get_logger().info(f"[nav2] waiting for action server '{self.server_name}' ...")
-
         x, y = self._route_map[self._idx]
+
         if self._idx < len(self._route_map) - 1:
             nx, ny = self._route_map[self._idx + 1]
             yaw = math.atan2(ny - y, nx - x)
         else:
-            yaw = 0.0
+            try:
+                rx, ry, _ = self._get_robot_pose()
+                yaw = math.atan2(y - ry, x - rx)
+            except Exception:
+                yaw = 0.0
 
-        goal = NavigateToPose.Goal()
-        goal.pose = PoseStamped()
-        goal.pose.header.frame_id = self.goal_frame
-        goal.pose.header.stamp = self.get_clock().now().to_msg()
-        goal.pose.pose.position.x = float(x)
-        goal.pose.pose.position.y = float(y)
-        goal.pose.pose.position.z = 0.0
-        goal.pose.pose.orientation = yaw_to_quat(yaw)
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = self.goal_frame
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        goal_pose.pose.position.x = float(x)
+        goal_pose.pose.position.y = float(y)
+        goal_pose.pose.position.z = 0.0
+        goal_pose.pose.orientation = yaw_to_quat(yaw)
 
-        self._in_flight = True
-        self.get_logger().info(f"[nav2] goal {self._idx+1}/{len(self._route_map)}: x={x:.2f} y={y:.2f}")
+        self.get_logger().info(
+            f"[nav2] goal {self._idx+1}/{len(self._route_map)}: "
+            f"x={x:.2f} y={y:.2f} yaw={yaw:.2f}"
+        )
 
-        fut = self._action_client.send_goal_async(goal)
-        fut.add_done_callback(self._on_goal_response)
-
-    def _on_goal_response(self, future):
-        gh = future.result()
-        if not gh.accepted:
-            self.get_logger().error("[nav2] goal rejected")
-            self._in_flight = False
-            return
-        rf = gh.get_result_async()
-        rf.add_done_callback(self._on_result)
-
-    def _on_result(self, future):
-        status = future.result().status
-        self.get_logger().info(f"[nav2] result status={status}")
-        self._in_flight = False
-
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            self._idx += 1
-            self._send_next_goal()
-            return
-
-        # ABORTED/CANCELED/etc
-        if self.continue_on_abort:
-            self.get_logger().warning("[nav2] goal failed, continuing (continue_on_abort=True)")
-            self._idx += 1
-            self._send_next_goal()
-        else:
-            self.get_logger().error("[nav2] goal failed, stopping (continue_on_abort=False)")
+        self.navigator.goToPose(goal_pose)
+        self._nav_active = True
 
 
 # ======================= main =======================
@@ -549,9 +566,9 @@ def main():
     parser.add_argument("--require-frame", default="wgs84", help="Expected frame_id for clicked points")
     parser.add_argument("--goal-frame", default="map", help="Nav2 goal frame")
     parser.add_argument("--base-frame", default="panther/base_link", help="Robot base frame")
-    parser.add_argument("--server-name", default="navigate_to_pose", help="Nav2 NavigateToPose action name")
     parser.add_argument("--continue-on-abort", action="store_true", help="If a goal fails, continue to next")
     parser.add_argument("--max-goals", type=int, default=400, help="Safety cap on number of goals (0 disables)")
+    parser.add_argument("--skip-near", type=float, default=1.0, help="Skip initial goals closer than this distance to robot (m)")
 
     args = parser.parse_args()
 
@@ -567,9 +584,9 @@ def main():
         require_frame=args.require_frame,
         goal_frame=args.goal_frame,
         base_frame=args.base_frame,
-        server_name=args.server_name,
         continue_on_abort=args.continue_on_abort,
         max_goals=args.max_goals,
+        skip_near_m=args.skip_near,
     )
 
     try:
