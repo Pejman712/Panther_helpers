@@ -1,43 +1,4 @@
 #!/usr/bin/env python3
-"""
-Mapviz click GPS planner with optional localized mode and manual anchor heading offset.
-
-Modes:
-1) Default mode:
-   - Click START in Mapviz
-   - Click GOAL in Mapviz
-   - Plan OSMnx route from START -> GOAL
-   - Convert route to map frame
-   - Follow sequentially with BasicNavigator.goToPose()
-
-2) Localized mode (--localized):
-   - Robot's current pose is used as START
-   - User clicks only GOAL in Mapviz
-   - Plan OSMnx route from current robot position -> GOAL
-   - Convert route to map frame
-   - Follow sequentially with BasicNavigator.goToPose()
-
-Conversion modes:
-  A) Anchor (default): lon/lat -> UTM local XY -> anchor at current robot pose in "map" using TF
-  B) FromLL: lon/lat -> robot_localization /fromLL -> "map" points
-
-Manual anchor correction:
-  --anchor-yaw-offset-deg <deg>
-    Adds a fixed heading offset in degrees to the anchor rotation.
-    Useful when the route is consistently rotated relative to the map frame.
-
-Notes:
-- In localized + use_fromll mode, /toLL is used to convert current robot map pose to lat/lon.
-- In localized + anchor mode, exact geographic start is not available unless /toLL exists.
-  For best results in localized mode, prefer --use-fromll.
-
-Run examples:
-  python3 gps_planner_mapviz.py
-  python3 gps_planner_mapviz.py --anchor-yaw-offset-deg -90
-  python3 gps_planner_mapviz.py --localized
-  python3 gps_planner_mapviz.py --use-fromll
-  python3 gps_planner_mapviz.py --localized --use-fromll --fromll-service /fromLL --toll-service /toLL
-"""
 
 import argparse
 import math
@@ -223,21 +184,30 @@ class ClickPlanner(Node):
 
         self.fromll_client = None
         self.toll_client = None
-        self._fromll_futures: List[Future] = []
+
+        # Sequential /fromLL conversion state
         self._pending_lonlats: List[Tuple[float, float]] = []
+        self._fromll_results: List[Tuple[float, float]] = []
+        self._current_fromll_future: Optional[Future] = None
+        self._current_fromll_index = 0
         self._converting = False
+        self._fromll_start_time: Optional[float] = None
+
+        # Increased because navsat_transform_node can be slow just after startup
+        self._fromll_timeout_sec = 30.0
+        self._toll_timeout_sec = 5.0
 
         if self.use_fromll:
             self.fromll_client = self.create_client(FromLL, self.fromll_service)
             while not self.fromll_client.wait_for_service(timeout_sec=1.0):
                 self.get_logger().info(f"[fromLL] waiting for service '{self.fromll_service}' ...")
-            self.get_logger().info(f"[fromLL] service ready ✅ ({self.fromll_service})")
+            self.get_logger().info(f"[fromLL] service ready ({self.fromll_service})")
 
         if self.localized and self.use_fromll:
             self.toll_client = self.create_client(ToLL, self.toll_service)
             while not self.toll_client.wait_for_service(timeout_sec=1.0):
                 self.get_logger().info(f"[toLL] waiting for service '{self.toll_service}' ...")
-            self.get_logger().info(f"[toLL] service ready ✅ ({self.toll_service})")
+            self.get_logger().info(f"[toLL] service ready ({self.toll_service})")
 
         self.create_subscription(PointStamped, self.clicked_topic, self._clicked_cb, 10)
 
@@ -254,7 +224,7 @@ class ClickPlanner(Node):
 
         self._worker_timer = self.create_timer(0.1, self._worker)
 
-        mode_name = 'fromLL' if self.use_fromll else 'anchor'
+        mode_name = "fromLL" if self.use_fromll else "anchor"
         if self.localized:
             self.get_logger().info(
                 "[ready] Localized mode ON: click GOAL in Mapviz "
@@ -333,10 +303,24 @@ class ClickPlanner(Node):
         req.map_point.z = 0.0
 
         fut = self.toll_client.call_async(req)
+        t0 = time.time()
+
         while rclpy.ok() and not fut.done():
+            if (time.time() - t0) > self._toll_timeout_sec:
+                raise RuntimeError(
+                    f"/toLL timeout after {self._toll_timeout_sec:.1f}s. "
+                    "navsat_transform_node is likely not ready."
+                )
             rclpy.spin_once(self, timeout_sec=0.05)
 
+        exc = fut.exception()
+        if exc is not None:
+            raise RuntimeError(f"/toLL call failed: {exc}")
+
         resp = fut.result()
+        if resp is None:
+            raise RuntimeError("/toLL returned no response")
+
         lat = float(resp.ll_point.latitude)
         lon = float(resp.ll_point.longitude)
         return lat, lon
@@ -354,7 +338,9 @@ class ClickPlanner(Node):
         lon = float(msg.point.x)
 
         if self.localized:
-            self.get_logger().info(f"[state] GOAL set ✅ lat={lat:.7f} lon={lon:.7f}. Planning from current robot pose...")
+            self.get_logger().info(
+                f"[state] GOAL set lat={lat:.7f} lon={lon:.7f}. Planning from current robot pose..."
+            )
             self._reset_all()
             self.goal_ll = (lat, lon)
             self._plan_route_and_prepare()
@@ -363,19 +349,19 @@ class ClickPlanner(Node):
         if self.start_ll is None:
             self._reset_all()
             self.start_ll = (lat, lon)
-            self.get_logger().info(f"[state] START set ✅ lat={lat:.7f} lon={lon:.7f}. Now click GOAL.")
+            self.get_logger().info(f"[state] START set lat={lat:.7f} lon={lon:.7f}. Now click GOAL.")
             return
 
         if self.goal_ll is None:
             self.goal_ll = (lat, lon)
-            self.get_logger().info(f"[state] GOAL set ✅ lat={lat:.7f} lon={lon:.7f}. Planning...")
+            self.get_logger().info(f"[state] GOAL set lat={lat:.7f} lon={lon:.7f}. Planning...")
             self._plan_route_and_prepare()
             return
 
         self.get_logger().info("[state] resetting (new START)")
         self._reset_all()
         self.start_ll = (lat, lon)
-        self.get_logger().info(f"[state] START set ✅ lat={lat:.7f} lon={lon:.7f}. Now click GOAL.")
+        self.get_logger().info(f"[state] START set lat={lat:.7f} lon={lon:.7f}. Now click GOAL.")
 
     def _reset_all(self):
         self.start_ll = None
@@ -384,22 +370,25 @@ class ClickPlanner(Node):
         self._idx = 0
         self._nav_active = False
 
-        self._fromll_futures.clear()
         self._pending_lonlats.clear()
+        self._fromll_results.clear()
+        self._current_fromll_future = None
+        self._current_fromll_index = 0
         self._converting = False
+        self._fromll_start_time = None
 
     # ---------------- planning + conversion ----------------
 
     def _plan_route_and_prepare(self):
         if self.goal_ll is None:
-            self.get_logger().error("[plan] goal not set ❌")
+            self.get_logger().error("[plan] goal not set")
             return
 
         if self.localized:
             try:
                 if self.use_fromll:
                     s_lat, s_lon = self._get_robot_lonlat_from_toll()
-                    self.get_logger().info(f"[localized] robot start from /toLL ✅ lat={s_lat:.7f} lon={s_lon:.7f}")
+                    self.get_logger().info(f"[localized] robot start from /toLL lat={s_lat:.7f} lon={s_lon:.7f}")
                 else:
                     self.get_logger().warning(
                         "[localized] anchor mode without /toLL uses an approximate start for OSMnx. "
@@ -408,12 +397,12 @@ class ClickPlanner(Node):
                     g_lat, g_lon = self.goal_ll
                     s_lat, s_lon = g_lat, g_lon
             except Exception as e:
-                self.get_logger().error(f"[localized] failed to determine robot start ❌: {e}")
+                self.get_logger().error(f"[localized] failed to determine robot start: {e}")
                 self._reset_all()
                 return
         else:
             if self.start_ll is None:
-                self.get_logger().error("[plan] start not set ❌")
+                self.get_logger().error("[plan] start not set")
                 return
             s_lat, s_lon = self.start_ll
 
@@ -430,50 +419,82 @@ class ClickPlanner(Node):
                 dist_m=self.graph_dist_m,
             )
         except Exception as e:
-            self.get_logger().error(f"[plan] OSMnx failed ❌: {e}")
+            self.get_logger().error(f"[plan] OSMnx failed: {e}")
             self._reset_all()
             return
 
-        self.get_logger().info(f"[plan] route computed ✅ points={len(lonlats)} time={time.time()-t0:.2f}s")
+        self.get_logger().info(f"[plan] route computed points={len(lonlats)} time={time.time() - t0:.2f}s")
         if len(lonlats) < 2:
-            self.get_logger().error("[plan] route too short ❌")
+            self.get_logger().error("[plan] route too short")
             self._reset_all()
             return
 
         if self.use_fromll:
             if self.fromll_client is None:
-                self.get_logger().error("[fromLL] use_fromll=True but client not created ❌")
+                self.get_logger().error("[fromLL] use_fromll=True but client not created")
                 self._reset_all()
                 return
 
             self._pending_lonlats = lonlats[:]
-            self._fromll_futures = []
+            self._fromll_results = []
+            self._current_fromll_future = None
+            self._current_fromll_index = 0
             self._converting = True
+            self._fromll_start_time = None
 
-            for i, (lon, lat) in enumerate(self._pending_lonlats, start=1):
-                req = FromLL.Request()
-                req.ll_point.longitude = float(lon)
-                req.ll_point.latitude = float(lat)
-                req.ll_point.altitude = 0.0
-                self._fromll_futures.append(self.fromll_client.call_async(req))
-                if i == 1 or i == len(self._pending_lonlats) or i % 50 == 0:
-                    self.get_logger().info(f"[fromLL] queued {i}/{len(self._pending_lonlats)}")
+            self.get_logger().info(f"[fromLL] starting sequential conversion points={len(self._pending_lonlats)}")
+            self._send_next_fromll_request()
+            return
 
-            self.get_logger().info("[fromLL] all conversions queued ✅")
-        else:
-            try:
-                route_map = self._convert_anchor(lonlats)
-            except Exception as e:
-                self.get_logger().error(f"[anchor] conversion failed ❌: {e}")
-                self._reset_all()
-                return
+        try:
+            route_map = self._convert_anchor(lonlats)
+        except Exception as e:
+            self.get_logger().error(f"[anchor] conversion failed: {e}")
+            self._reset_all()
+            return
 
+        self._finalize_route_and_start(route_map)
+
+    def _send_next_fromll_request(self):
+        if not self._pending_lonlats:
+            self.get_logger().error("[fromLL] no pending lon/lat points")
+            self._reset_all()
+            return
+
+        if self._current_fromll_index >= len(self._pending_lonlats):
+            route_map = self._fromll_results[:]
+
+            self._converting = False
+            self._pending_lonlats.clear()
+            self._fromll_results.clear()
+            self._current_fromll_future = None
+            self._current_fromll_index = 0
+            self._fromll_start_time = None
+
+            self.get_logger().info(f"[fromLL] conversion complete points={len(route_map)}")
             self._finalize_route_and_start(route_map)
+            return
+
+        lon, lat = self._pending_lonlats[self._current_fromll_index]
+
+        req = FromLL.Request()
+        req.ll_point.longitude = float(lon)
+        req.ll_point.latitude = float(lat)
+        req.ll_point.altitude = 0.0
+
+        self._current_fromll_future = self.fromll_client.call_async(req)
+        self._fromll_start_time = time.time()
+
+        i = self._current_fromll_index + 1
+        n = len(self._pending_lonlats)
+        self.get_logger().info(f"[fromLL] requested {i}/{n} lat={lat:.7f} lon={lon:.7f}")
 
     def _convert_anchor(self, lonlats: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
         """
-        Convert lon/lat route to local UTM coordinates, then anchor and rotate it into map frame
-        using the robot's current pose plus an optional manual heading offset.
+        Convert lon/lat route to local UTM coordinates, then anchor it into map frame
+        using only translation plus an optional fixed manual yaw offset.
+
+        No robot heading is used here.
         """
         lon0, lat0 = lonlats[0]
         utm = utm_crs_for_lonlat(lon0, lat0)
@@ -485,17 +506,16 @@ class ClickPlanner(Node):
             x, y = to_utm.transform(lon, lat)
             local_xy.append((x - x0, y - y0))
 
-        rx, ry, ryaw = self._get_robot_pose()
-        anchor_yaw = ryaw + self.anchor_yaw_offset_rad
+        rx, ry, _ = self._get_robot_pose()
 
-        self.get_logger().info(
-            f"[anchor] robot pose: x={rx:.2f} y={ry:.2f} yaw={ryaw:.3f} rad "
-            f"offset={self.anchor_yaw_offset_deg:.2f} deg "
-            f"anchor_yaw={anchor_yaw:.3f} rad"
-        )
-
+        anchor_yaw = self.anchor_yaw_offset_rad
         c = math.cos(anchor_yaw)
         s = math.sin(anchor_yaw)
+
+        self.get_logger().info(
+            f"[anchor] robot pose anchor only: x={rx:.2f} y={ry:.2f} "
+            f"fixed_offset={self.anchor_yaw_offset_deg:.2f} deg"
+        )
 
         route_map: List[Tuple[float, float]] = []
         for dx, dy in local_xy:
@@ -509,7 +529,7 @@ class ClickPlanner(Node):
         before = len(route_map)
         route_map = resample_polyline(route_map, self.spacing_m)
         after = len(route_map)
-        self.get_logger().info(f"[route] densified ✅ points={after} (was {before}) spacing_m={self.spacing_m:.2f}")
+        self.get_logger().info(f"[route] densified points={after} (was {before}) spacing_m={self.spacing_m:.2f}")
 
         if self.max_goals > 0 and len(route_map) > self.max_goals:
             original_last = route_map[-1]
@@ -532,7 +552,7 @@ class ClickPlanner(Node):
             self.get_logger().warning(f"[route] could not evaluate skip_near_m: {e}")
 
         if not route_map:
-            self.get_logger().error("[route] no usable goals remain after filtering ❌")
+            self.get_logger().error("[route] no usable goals remain after filtering")
             self._reset_all()
             return
 
@@ -540,37 +560,59 @@ class ClickPlanner(Node):
         self._idx = 0
         self._nav_active = False
 
-        self.get_logger().info(f"[nav2] route ready ✅ goals={len(self._route_map)} starting...")
+        self.get_logger().info(f"[nav2] route ready goals={len(self._route_map)} starting...")
         self._send_next_goal()
 
     # ---------------- worker ----------------
 
     def _worker(self):
         if self._converting:
-            if not self._fromll_futures:
+            if self._current_fromll_future is None:
+                self._send_next_fromll_request()
                 return
 
-            if any(not f.done() for f in self._fromll_futures):
+            if not self._current_fromll_future.done():
+                if self._fromll_start_time is not None:
+                    elapsed = time.time() - self._fromll_start_time
+                    if elapsed > self._fromll_timeout_sec:
+                        i = self._current_fromll_index + 1
+                        n = len(self._pending_lonlats)
+                        lon, lat = self._pending_lonlats[self._current_fromll_index]
+                        self.get_logger().error(
+                            f"[fromLL] timeout on point {i}/{n} after {elapsed:.1f}s "
+                            f"lat={lat:.7f} lon={lon:.7f}. "
+                            "Try calling /fromLL manually with this same lat/lon."
+                        )
+                        self._reset_all()
                 return
 
-            route_map: List[Tuple[float, float]] = []
             try:
-                for i, f in enumerate(self._fromll_futures, start=1):
-                    resp = f.result()
-                    route_map.append((float(resp.map_point.x), float(resp.map_point.y)))
-                    if i == 1 or i == len(self._fromll_futures) or i % 50 == 0:
-                        self.get_logger().info(f"[fromLL] converted {i}/{len(self._fromll_futures)}")
-            except Exception as e:
-                self.get_logger().error(f"[fromLL] conversion failed ❌: {e}")
-                self._reset_all()
-                return
-            finally:
-                self._converting = False
-                self._fromll_futures.clear()
-                self._pending_lonlats.clear()
+                exc = self._current_fromll_future.exception()
+                if exc is not None:
+                    raise RuntimeError(exc)
 
-            self.get_logger().info(f"[fromLL] conversion complete points={len(route_map)}")
-            self._finalize_route_and_start(route_map)
+                resp = self._current_fromll_future.result()
+                if resp is None:
+                    raise RuntimeError("/fromLL returned no response")
+
+                x = float(resp.map_point.x)
+                y = float(resp.map_point.y)
+                self._fromll_results.append((x, y))
+
+                i = self._current_fromll_index + 1
+                n = len(self._pending_lonlats)
+                self.get_logger().info(f"[fromLL] converted {i}/{n}: x={x:.2f} y={y:.2f}")
+
+                self._current_fromll_index += 1
+                self._current_fromll_future = None
+                self._fromll_start_time = None
+
+                self._send_next_fromll_request()
+
+            except Exception as e:
+                self.get_logger().error(f"[fromLL] conversion failed: {e}")
+                self._reset_all()
+
             return
 
         if self._nav_active and self._route_map is not None:
@@ -606,7 +648,7 @@ class ClickPlanner(Node):
         if self._nav_active:
             return
         if self._idx >= len(self._route_map):
-            self.get_logger().info("[nav2] finished all goals ✅")
+            self.get_logger().info("[nav2] finished all goals")
             return
 
         x, y = self._route_map[self._idx]
@@ -630,7 +672,7 @@ class ClickPlanner(Node):
         goal_pose.pose.orientation = yaw_to_quat(yaw)
 
         self.get_logger().info(
-            f"[nav2] goal {self._idx+1}/{len(self._route_map)}: "
+            f"[nav2] goal {self._idx + 1}/{len(self._route_map)}: "
             f"x={x:.2f} y={y:.2f} yaw={yaw:.2f}"
         )
 
@@ -650,10 +692,10 @@ def main():
     parser.add_argument("--spacing", type=float, default=10.0, help="Densify spacing in meters (smaller => more points)")
     parser.add_argument("--graph-dist", type=float, default=1200.0, help="OSMnx graph dist in meters")
     parser.add_argument("--network-type", default="all", help="OSMnx network_type (all, walk, drive, bike)")
-    parser.add_argument("--clicked-topic", default="/panther/clicked_point", help="Mapviz click topic")
+    parser.add_argument("--clicked-topic", default="/clicked_point", help="Mapviz click topic")
     parser.add_argument("--require-frame", default="wgs84", help="Expected frame_id for clicked points")
     parser.add_argument("--goal-frame", default="map", help="Nav2 goal frame")
-    parser.add_argument("--base-frame", default="panther/base_link", help="Robot base frame")
+    parser.add_argument("--base-frame", default="base_link", help="Robot base frame")
     parser.add_argument("--continue-on-abort", action="store_true", help="If a goal fails, continue to next")
     parser.add_argument("--max-goals", type=int, default=400, help="Safety cap on number of goals (0 disables)")
     parser.add_argument("--skip-near", type=float, default=1.0, help="Skip initial goals closer than this distance to robot (m)")

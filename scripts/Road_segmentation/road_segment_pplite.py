@@ -26,7 +26,7 @@ class RoadFollowerNode(Node):
             10
         )
 
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmd_pub = self.create_publisher(Twist, '/panther/cmd_vel', 10)
 
         # Control timer: publish cmd_vel independently of image callback
         self.control_timer = self.create_timer(0.05, self.control_loop)  # 20 Hz
@@ -39,10 +39,9 @@ class RoadFollowerNode(Node):
         # ------------------------------------------------------------
         # Model settings
         # ------------------------------------------------------------
-        self.weights_path = '/u/97/habibip1/data/Downloads/ppliteset_pp2torch_cityscape_pretrained.pth'
+        self.weights_path = '/pathto/ppliteset_pp2torch_cityscape_pretrained.pth'
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # Lower input size than before for better speed
         self.model_input_w = 512
         self.model_input_h = 256
 
@@ -55,18 +54,40 @@ class RoadFollowerNode(Node):
         # ------------------------------------------------------------
         # Controller settings
         # ------------------------------------------------------------
-        self.linear_speed = 0.20          # constant forward speed
-        self.kp_angular = 0.90            # steering gain
-        self.max_angular_speed = 0.70     # rad/s
-        self.angular_smoothing = 0.30     # low-pass filter [0..1]
+        self.linear_speed = 0.20
+        self.kp_angular = 0.90
+        self.max_angular_speed = 0.70
+        self.angular_smoothing = 0.30
 
-        self.stop_when_road_lost = False  # keep moving slowly if road is briefly lost
-        self.lost_timeout_frames = 6      # use previous steering for a few frames
+        self.stop_when_road_lost = False
+        self.lost_timeout_frames = 6
 
+        # ------------------------------------------------------------
+        # Human safety-stop settings
+        # ------------------------------------------------------------
+        # Cityscapes trainId:
+        # 11 = person
+        #
+        # If you also want to stop for riders, use:
+        # self.human_class_ids = {11, 12}
+        self.human_class_ids = {11}
+
+        # Stop if the largest connected human region is bigger than this.
+        # Tune this for your camera resolution and stopping distance.
+        self.human_stop_pixel_threshold = 1500
+
+        self.human_stop_active = False
+        self.human_area_px = 0
+        self.last_human_mask = None
+
+        # ------------------------------------------------------------
         # Scan-line road-center extraction
-        self.lookahead_y_start_ratio = 0.62
-        self.lookahead_y_end_ratio = 0.90
-        self.num_scan_rows = 4
+        # ------------------------------------------------------------
+        # Start higher in the image and use more rows.
+        # This gives more dots and a more stable road center estimate.
+        self.lookahead_y_start_ratio = 0.60
+        self.lookahead_y_end_ratio = 0.94
+        self.num_scan_rows = 10
         self.min_road_width_px = 20
 
         # ------------------------------------------------------------
@@ -94,7 +115,7 @@ class RoadFollowerNode(Node):
         self.last_center_points = []
         self.last_edge_points = []
 
-        # Cityscapes trainId colors (BGR for OpenCV)
+        # Cityscapes trainId colors, BGR for OpenCV
         self.class_colors_bgr = {
             0:  (128,  64, 128),  # road
             1:  (232,  35, 244),  # sidewalk
@@ -226,6 +247,39 @@ class RoadFollowerNode(Node):
         road_mask = self.refine_mask(road_mask)
         return road_mask
 
+    def detect_human_obstacle(self, pred):
+        """
+        Detect humans from the semantic segmentation prediction.
+
+        Returns:
+            human_stop_active:
+                True if the largest human blob area is above the threshold.
+            max_area:
+                Largest connected human component area in pixels.
+            human_mask:
+                Binary mask of detected human pixels.
+        """
+        if pred is None:
+            return False, 0, None
+
+        human_mask = np.isin(pred, list(self.human_class_ids)).astype(np.uint8) * 255
+
+        # Clean small segmentation noise
+        kernel = np.ones((3, 3), np.uint8)
+        human_mask = cv2.morphologyEx(human_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        human_mask = cv2.morphologyEx(human_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(human_mask, 8)
+
+        max_area = 0
+        if num_labels > 1:
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            max_area = int(np.max(areas))
+
+        human_stop_active = max_area >= self.human_stop_pixel_threshold
+
+        return human_stop_active, max_area, human_mask
+
     def segment_classes(self, frame_bgr):
         h, w = frame_bgr.shape[:2]
         input_tensor = self.preprocess(frame_bgr)
@@ -283,7 +337,7 @@ class RoadFollowerNode(Node):
         if not center_points:
             return None, [], []
 
-        # Weighted average: closer rows (near bottom) matter more
+        # Weighted average: closer rows near the bottom matter more
         weights = np.linspace(1.0, 2.0, len(center_points))
         target_x = int(np.average([p[0] for p in center_points], weights=weights))
         target_y = int(np.average([p[1] for p in center_points], weights=weights))
@@ -310,7 +364,7 @@ class RoadFollowerNode(Node):
 
     def draw_class_legend(self, image, pred):
         present_classes = [int(c) for c in np.unique(pred)]
-        x0, y0 = 15, 90
+        x0, y0 = 15, 140
         box_w, box_h = 18, 18
         line_h = 24
 
@@ -351,6 +405,12 @@ class RoadFollowerNode(Node):
             self.last_pred = pred
             self.last_color_mask = color_mask
             self.last_mask = road_mask
+
+            # Human safety detection
+            self.human_stop_active, self.human_area_px, self.last_human_mask = (
+                self.detect_human_obstacle(pred)
+            )
+
         except Exception as e:
             self.get_logger().error(f'PPLiteSeg inference failed: {e}')
             return
@@ -380,8 +440,27 @@ class RoadFollowerNode(Node):
         linear_x = 0.0
         angular_z = 0.0
 
+        # ------------------------------------------------------------
+        # Highest-priority safety stop
+        # ------------------------------------------------------------
+        if self.human_stop_active:
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+            self.cmd_pub.publish(cmd)
+
+            self.get_logger().warn(
+                f'Human detected: area={self.human_area_px}px. Publishing zero velocity.'
+            )
+            return
+
+        # ------------------------------------------------------------
+        # Normal road-following control
+        # ------------------------------------------------------------
         if self.latest_img_width is not None and self.latest_target_x is not None:
-            angular_z, _, _ = self.compute_angular_velocity(self.latest_img_width, self.latest_target_x)
+            angular_z, _, _ = self.compute_angular_velocity(
+                self.latest_img_width,
+                self.latest_target_x
+            )
             linear_x = self.linear_speed
             self.last_good_angular_z = angular_z
 
@@ -449,7 +528,7 @@ class RoadFollowerNode(Node):
             cv2.putText(
                 result,
                 'Road target not found',
-                (15, 58),
+                (15, 82),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 (0, 0, 255),
@@ -471,7 +550,7 @@ class RoadFollowerNode(Node):
         cv2.putText(
             result,
             f'linear={self.linear_speed:.2f}  last_ang={self.prev_angular_z:+.2f}',
-            (15, 58 if self.latest_target_point is not None else 82),
+            (15, 58),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (255, 255, 255),
@@ -479,12 +558,49 @@ class RoadFollowerNode(Node):
             cv2.LINE_AA
         )
 
+        if self.human_stop_active:
+            cv2.putText(
+                result,
+                f'HUMAN STOP active, area={self.human_area_px}px',
+                (15, 115),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA
+            )
+        else:
+            cv2.putText(
+                result,
+                f'human_area={self.human_area_px}px',
+                (15, 115),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA
+            )
+
         if self.last_pred is not None:
             self.draw_class_legend(result, self.last_pred)
 
         cv2.imshow('Image', frame)
-        cv2.imshow('Road Mask', self.last_mask if self.last_mask is not None else np.zeros((h, w), dtype=np.uint8))
-        cv2.imshow('All Masks Color', self.last_color_mask if self.last_color_mask is not None else np.zeros((h, w, 3), dtype=np.uint8))
+
+        cv2.imshow(
+            'Road Mask',
+            self.last_mask if self.last_mask is not None else np.zeros((h, w), dtype=np.uint8)
+        )
+
+        cv2.imshow(
+            'Human Mask',
+            self.last_human_mask if self.last_human_mask is not None else np.zeros((h, w), dtype=np.uint8)
+        )
+
+        cv2.imshow(
+            'All Masks Color',
+            self.last_color_mask if self.last_color_mask is not None else np.zeros((h, w, 3), dtype=np.uint8)
+        )
+
         cv2.imshow('PPLiteSeg Overlay + Control', result)
         cv2.waitKey(1)
 
